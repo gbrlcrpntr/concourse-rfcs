@@ -16,8 +16,9 @@ created. Manual triggers may supply overrides through the web UI, `fly`, or the
 existing create-job-build API.
 
 The RFC also proposes generic JSON trigger webhooks. A webhook declaration can
-filter a JSON payload and map fields from it to declared job vars before
-creating a build. The webhook mechanism is deliberately provider-neutral.
+authenticate a bounded request, filter its JSON payload, map fields from it to
+declared job vars, and optionally deduplicate provider retries before creating
+a build. The webhook mechanism is deliberately provider-neutral.
 
 The parameter model does not depend on the webhook endpoint. The two parts can
 be implemented and reviewed independently: manual triggers establish the job
@@ -73,6 +74,8 @@ instanced pipelines.
   declaration's current default.
 * A **trigger webhook** is a named job-level rule which authenticates, filters,
   and maps a JSON request into trigger overrides.
+* A **delivery ID** is an opaque provider-generated request identifier used to
+  make retries of one accepted delivery idempotent for a job and webhook.
 
 The term “var” is used to connect this feature to Concourse's existing var
 syntax and, specifically, the local var source introduced by [RFC #27][rfc-27].
@@ -252,61 +255,93 @@ A job may declare one or more trigger webhooks:
 jobs:
 - name: build-pull-request
   vars:
-    branch:
-      default: main
-    commit:
+    pr_number:
+      type: number
+      required: true
+    head_sha:
+      required: true
+    head_ref:
+      required: true
+    base_ref:
       required: true
 
   trigger_webhooks:
-  - name: pull-request-opened
-    token: ((job-webhook-token))
+  - name: pull-request
+    authentication:
+      hmac_sha256:
+        secret: ((github-webhook-secret))
+        header: X-Hub-Signature-256
+        prefix: sha256=
+    delivery_id:
+      header: X-GitHub-Delivery
     filter:
-      action: opened
+      action:
+        one_of: [opened, reopened, synchronize, ready_for_review]
+      pull_request.draft: false
     var_mapping:
-      branch: pull_request.head.ref
-      commit: pull_request.head.sha
+      pr_number: number
+      head_sha: pull_request.head.sha
+      head_ref: pull_request.head.ref
+      base_ref: pull_request.base.ref
 ```
 
 The endpoint is:
 
 ```text
 POST /api/v1/teams/:team/pipelines/:pipeline/jobs/:job/builds/webhook
-    ?webhook_token=TOKEN
-    &name=pull-request-opened
+    ?name=pull-request
 ```
 
-The token uses the existing `webhook_token` query convention from resource
-check webhooks and may itself be resolved through the pipeline's configured
-var sources. The endpoint does not require a bearer token. If `name` is
-omitted, the job must have exactly one configured trigger webhook.
+Each webhook configures exactly one authentication form. `token` retains the
+existing `webhook_token` query convention from resource check webhooks.
+Alternatively, `authentication.hmac_sha256` names a signature header, an
+optional prefix to strip, and a secret used to verify the hex-encoded
+HMAC-SHA256 signature over the exact request body. Tokens and HMAC secrets may
+be resolved through the pipeline's configured var sources. The endpoint does
+not require a bearer token. If `name` is omitted, the job must have exactly one
+configured trigger webhook.
 
-The request body must be a JSON object and is limited to 1 MiB. Filters are
-dot-path-to-value equality checks. Every filter must match. `var_mapping` maps
-declared var names to dot paths in the payload. A missing mapped field is
-omitted for an optional var and rejected for a required var. Extracted values
-go through the same declaration validation as manual overrides.
+The request body must be a JSON object and is limited to 1 MiB. Filters map
+payload dot paths to either an exact JSON value or an explicit
+`{one_of: [...]}` condition. Every filter must match. The explicit operator
+avoids making all YAML arrays ambiguous between literal array equality and set
+membership. `var_mapping` maps declared var names to dot paths in the payload.
+A missing mapped field is omitted for an optional var and rejected for a
+required var. Extracted values go through the same declaration validation as
+manual overrides.
+
+An optional `delivery_id.header` names a request header containing an opaque
+provider delivery identifier. Concourse stores that identifier as trigger
+metadata and enforces uniqueness for the job and named webhook. Delivery IDs
+must be valid UTF-8 and no more than 256 bytes. The first matching delivery
+creates a build; a retry with the same identifier returns the original build
+without consuming another job build number. Concourse does not infer delivery
+identity from mutable payload fields.
 
 Responses are:
 
 | Condition | Response |
 | --- | --- |
-| Valid token, matching filter, valid mapped vars | HTTP 201 and the created build. |
-| Matching token, non-matching filter | HTTP 200 and `{"skipped": true}`. |
-| Invalid token | HTTP 401. |
-| Missing token, malformed JSON, invalid mapping or vars | HTTP 400. |
+| Valid authentication, matching filter, valid mapped vars, new delivery | HTTP 201 and the created build. |
+| Valid authentication, previously accepted delivery ID | HTTP 200 and the original build. |
+| Valid authentication, non-matching filter | HTTP 200 and `{"skipped": true}`. |
+| Invalid token or signature | HTTP 401. |
+| Missing configured token/delivery header, malformed JSON, invalid mapping or vars | HTTP 400. |
 | Unknown job | HTTP 404. |
 
 The raw payload is discarded after filtering and extraction. The build stores
-only the resulting explicit overrides and records its creator as
-`webhook:<name>`.
+only the resulting explicit overrides, the optional opaque delivery ID, and
+its creator as `webhook:<name>`.
 
 Trigger webhooks are delivery-driven, not reconciled inputs. This first version
-does not deduplicate provider retries or impose ordering across requests: each
-valid matching delivery creates a build, and a request which never reaches
-Concourse creates no build. Mapping a branch or commit from a payload does not
-turn it into a Concourse resource version. When the value represents queryable,
-versioned external state, a resource and its check webhook remain the precise
-and recoverable model.
+deduplicates retries only when the pipeline author configures a provider
+delivery-ID header. It does not impose ordering across distinct requests, and
+a request which never reaches Concourse creates no build. Mapping a branch or
+commit from a payload does not turn it into a Concourse resource version. A PR
+job should map the immutable head SHA used for checkout as well as human-facing
+branch context; checking out only the mutable branch name creates a race. When
+the value represents queryable, versioned external state, a resource and its
+check webhook remain the precise and recoverable model.
 
 ### Security boundary
 
@@ -315,14 +350,16 @@ and may appear in API responses, the web UI, build plans, task arguments, and
 logs. Documentation and trigger forms must warn users not to supply
 credentials.
 
-Webhook query tokens can appear in proxy and access logs. Operators should use
-HTTPS, dedicated tokens, and query-string redaction. This proposal follows an
-existing Concourse convention for the first generic implementation; signed
-provider requests are discussed as a future extension.
+Webhook query tokens can appear in proxy and access logs. Operators retaining
+that compatibility mode should use HTTPS, dedicated tokens, and query-string
+redaction. HMAC-SHA256 authentication avoids placing the secret in the URL,
+authenticates the exact body, and uses constant-time digest comparison. It is
+generic rather than a claim to implement every provider's signature scheme;
+operators must configure the provider's documented header and prefix.
 
-The webhook declaration's token is not returned by the job presentation API.
-It is resolved only while handling a request. Raw webhook bodies are neither
-logged nor persisted by this feature.
+The webhook declaration's token or HMAC secret is not returned by the job
+presentation API. It is resolved only while handling a request. Raw webhook
+bodies are neither logged nor persisted by this feature.
 
 Authenticating an inbound request must not launch a build or container,
 or execute arbitrary prototype code. The PoC uses the same in-process
@@ -339,9 +376,9 @@ All interfaces are additive:
 * the existing empty-body create-job-build request remains valid;
 * the successful manual endpoint status remains HTTP 200;
 * the existing Go client method retains its signature;
-* old builds have no `trigger_vars`; and
-* the database migration adds a nullable JSONB column which is dropped by the
-  down migration.
+* old builds have no `trigger_vars` or delivery ID; and
+* database migrations add nullable trigger JSONB and text columns, with a
+  partial uniqueness constraint applying only to configured delivery IDs.
 
 Initial implementation can be reviewed in separate changes for the core
 schema/storage/runtime/API, `fly`, web UI, and webhook support. User-facing
@@ -366,10 +403,11 @@ redaction and access control; and one-off builds, which do not run a job.
 The job-var model is independent of deployment, test, or source-control
 domains. It is usable through every existing manual trigger surface.
 
-Webhooks operate on generic JSON equality and path extraction rather than a
-GitHub-, GitLab-, or Bitbucket-specific schema. Providers can change payloads
-without requiring Concourse releases; pipeline configuration contains the
-mapping.
+Webhooks operate on generic JSON equality, explicit `one_of` membership, path
+extraction, HMAC-SHA256 verification, and opaque delivery-ID headers rather
+than a GitHub-, GitLab-, or Bitbucket-specific schema. Providers can change
+payloads without requiring Concourse releases; pipeline configuration contains
+the mapping.
 
 The feature reuses the local var source and normal interpolation instead of
 introducing environment injection or a new templating system.
@@ -379,7 +417,8 @@ introducing environment injection or a new templating system.
 Declarations and mappings remain in pipeline configuration, which is the
 recoverable source of truth. Overrides belong to builds and disappear with
 their build history. Raw webhook payloads do not create a second durable state
-store.
+store. An optional opaque delivery ID is stored only with the build it
+identifies and has no independent lifecycle.
 
 Destroying a pipeline removes its declarations, webhook configuration, and
 build overrides. Restoring the pipeline config restores all behavior except
@@ -449,9 +488,11 @@ remains unchanged and should be preferred whenever an event merely indicates
 that queryable resource state may have changed.
 
 Trigger webhooks consume mapped payload fields because their purpose is to
-carry non-versioned invocation data into a build. This trades reconciliation
-and resource-version semantics for direct event delivery; the limitations are
-part of the interface rather than properties claimed from resources.
+carry non-versioned invocation data into a build. Immutable external identity,
+such as a PR head SHA, can make the invoked work precise, while the build still
+lacks resource checking, version history, `passed` constraints, and missed
+event reconciliation. Those limitations are part of the interface rather than
+properties claimed from resources.
 
 ## Prior art
 
@@ -482,6 +523,13 @@ parameters and credentials.
 defaults, descriptions, and typed manual inputs. [Jenkins Pipeline
 parameters][jenkins-parameters] expose string, text, boolean, choice, and
 password parameters through a `params` object.
+
+GitHub's [webhook validation guidance][github-webhook-validation] signs the raw
+request body with HMAC-SHA256 in `X-Hub-Signature-256`. Its [webhook best
+practices][github-webhook-best-practices] recommend using the unique
+`X-GitHub-Delivery` value to detect redeliveries. The proposal models the
+underlying signature header and delivery identity generically instead of
+hard-coding those GitHub names.
 
 These systems confirm that parameterized manual runs are a common CI workflow.
 Concourse differs by placing values in its existing local var scope and by
@@ -527,9 +575,11 @@ narrow case and make the delivery semantics explicit.
 
 Native handlers could validate provider signatures and offer richer event
 semantics, but every provider and payload revision would expand Concourse's
-maintenance surface. Generic JSON mapping provides a universal base. Signed
-provider adapters can be considered separately if generic token authentication
-is insufficient.
+maintenance surface. Generic JSON mapping, HMAC-SHA256 verification, explicit
+event membership, and configurable delivery-ID headers cover the common PR
+webhook mechanics without embedding provider payloads. Provider adapters can
+still be considered separately for signature schemes or event semantics which
+cannot be expressed safely by this base.
 
 ### Snapshotting every effective value
 
@@ -587,12 +637,14 @@ triggerable” and may make otherwise valid manual-only jobs harder to express.
 be confused with resource inputs, while “parameters” is more familiar in other
 CI systems. The PoC uses job `vars`, request `vars`, and build `trigger_vars`.
 
-### Is query-token authentication sufficient for generic webhooks?
+### Are query-token and generic HMAC authentication the right initial boundary?
 
-The PoC deliberately matches existing resource webhook behavior. Review should
-decide whether this endpoint may launch with that convention or must first
-support header tokens or signed-body verification. Provider-native signature
-algorithms should not be added implicitly to an otherwise generic mapper.
+The PoC retains query tokens for consistency with resource webhooks and adds
+configurable HMAC-SHA256 verification for providers such as GitHub. Review
+should decide whether both modes should launch, whether signed bodies should
+be required for new trigger webhooks, and whether header bearer tokens are a
+useful generic middle ground. Provider-specific signature canonicalization or
+key-discovery schemes should not be added implicitly to the JSON mapper.
 
 ## Future extensions
 
@@ -616,12 +668,17 @@ implementation:
   or `set_pipeline` requires an explicit data-flow and authorization model.
 * **Resource-backed choices.** A future UI could combine job vars with resource
   version selection, as suggested in discussion #9053.
-* **Signed provider webhooks.** Provider-specific signature verification or a
-  pluggable verifier may build on the generic mapping model.
-* **Delivery identity and duplicate suppression.** A later design could record
-  provider delivery identifiers and define replay windows, retention, and
-  conflict behavior. These semantics should not be inferred from a
-  provider-neutral payload in the first version.
+* **Additional signature schemes.** Provider-specific canonicalization,
+  asymmetric signatures, rotating keys, or a pluggable verifier may build on
+  the generic HMAC-SHA256 model.
+* **Correlated superseding.** A future declaration could map a stable logical
+  key such as PR number and request that older pending or running builds for
+  that key be superseded when a newer head SHA arrives. This is intentionally
+  not part of the PoC: it requires scheduler and cancellation semantics,
+  authorization and audit behavior, race handling, and a decision about
+  whether “supersede” means abort, skip, or merely deprioritize. Delivery-ID
+  deduplication is narrower: it suppresses retries of the same event and never
+  treats distinct PR updates as interchangeable.
 
 ## New implications
 
@@ -635,10 +692,11 @@ implementation:
   proposed resolution model. The web UI should make current-default behavior
   explicit when resetting or reusing values.
 * Generic webhooks allow external systems to create builds without a bearer
-  token. Operators must manage dedicated tokens and prevent query-string
-  leakage.
-* Generic webhooks are event-delivery mechanisms. Retries can create duplicate
-  builds, ordering is not guaranteed, and missed requests are not reconciled.
+  token. Operators must manage dedicated query tokens or signing secrets and
+  protect their ingress path.
+* Generic webhooks are event-delivery mechanisms. Configured delivery IDs
+  suppress exact retries, but distinct updates are not ordered or superseded,
+  and missed requests are not reconciled.
 * Supporting typed values embedded in strings broadens scalar interpolation
   for local vars and should be covered by compatibility tests.
 
@@ -654,4 +712,6 @@ implementation:
 [gitlab-inputs]: https://docs.gitlab.com/ci/inputs/
 [gitlab-variables]: https://docs.gitlab.com/ci/variables/
 [github-inputs]: https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#onworkflow_dispatchinputs
+[github-webhook-validation]: https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries
+[github-webhook-best-practices]: https://docs.github.com/en/webhooks/using-webhooks/best-practices-for-using-webhooks
 [jenkins-parameters]: https://www.jenkins.io/doc/book/pipeline/syntax/#parameters
