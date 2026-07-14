@@ -19,6 +19,10 @@ The RFC also proposes generic JSON trigger webhooks. A webhook declaration can
 filter a JSON payload and map fields from it to declared job vars before
 creating a build. The webhook mechanism is deliberately provider-neutral.
 
+The parameter model does not depend on the webhook endpoint. The two parts can
+be implemented and reviewed independently: manual triggers establish the job
+var model, while webhooks provide one additional source of overrides.
+
 Job vars in this proposal are non-secret build metadata. Secret or shared
 variables require additional authorization, redaction, and scoping semantics
 and are left to future RFCs.
@@ -52,6 +56,13 @@ free-form job values are not resource versions.
 
 `fly execute` is not an equivalent workflow. It creates a one-off build for a
 single task and does not run a configured pipeline job.
+
+This proposal is not a replacement for Concourse's spatial-automation model
+for branches and pull requests. A webhook creates one build from one delivered
+event; it does not discover the current set of pull requests, reconcile missed
+events, create pipeline instances, or provide cross-build `passed` semantics.
+Those workflows remain the domain of resources, `across`, `set_pipeline`, and
+instanced pipelines.
 
 ## Terminology
 
@@ -128,9 +139,9 @@ error.
 
 ### Runtime scope and interpolation
 
-Effective job vars seed the build's existing local var source before the first
-step runs. A job reads them using the source-qualified syntax established by
-RFC #27:
+Effective job vars seed the root scope of the build's existing local var
+source before the first step runs. A job reads them using the source-qualified
+syntax established by RFC #27:
 
 ```yaml
 ((.:branch))
@@ -139,6 +150,10 @@ RFC #27:
 This qualification prevents a trigger value from silently shadowing a
 credential lookup or a value from another var source. A later step such as
 `load_var` may replace a local value using the existing local-scope behavior.
+An `across` step creates a child local scope which inherits job vars; an
+`across` var with the same name shadows the job var only within that child
+scope and produces the existing shadowing warning. The root job var remains
+unchanged after the `across` step.
 
 When a typed value is the entire interpolated YAML node, its type is preserved.
 When a number or boolean is embedded in a string, it is rendered using its
@@ -285,6 +300,14 @@ The raw payload is discarded after filtering and extraction. The build stores
 only the resulting explicit overrides and records its creator as
 `webhook:<name>`.
 
+Trigger webhooks are delivery-driven, not reconciled inputs. This first version
+does not deduplicate provider retries or impose ordering across requests: each
+valid matching delivery creates a build, and a request which never reaches
+Concourse creates no build. Mapping a branch or commit from a payload does not
+turn it into a Concourse resource version. When the value represents queryable,
+versioned external state, a resource and its check webhook remain the precise
+and recoverable model.
+
 ### Security boundary
 
 Job vars are **not secrets**. They are persisted as ordinary build metadata
@@ -300,6 +323,13 @@ provider requests are discussed as a future extension.
 The webhook declaration's token is not returned by the job presentation API.
 It is resolved only while handling a request. Raw webhook bodies are neither
 logged nor persisted by this feature.
+
+Authenticating an inbound request must not launch a build or container,
+or execute arbitrary prototype code. The PoC uses the same in-process
+credential-manager evaluation available to resource check webhooks. If var
+sources later require container-backed prototype execution, webhook tokens
+will need either a restriction to cheaply resolvable sources or a separately
+cached or precomputed authentication design.
 
 ### Compatibility and migration
 
@@ -359,6 +389,70 @@ Keeping secrets out of the first version avoids presenting unredacted database
 state as a credential feature. Shared or secret values will require a design
 that preserves Concourse's recoverability and external-source-of-truth model.
 
+Webhook behavior is restored with pipeline configuration, but webhook delivery
+history is not an external source of truth and is deliberately not recreated.
+Workflows which must converge after missed notifications should use a resource
+check webhook, which wakes normal resource checking instead of consuming the
+request payload.
+
+## Relationship to existing Concourse work
+
+### Local vars and var steps
+
+[RFC #27][rfc-27] introduced the local var source, `((.:name))`, and specified
+that each build has a local scope populated during execution by steps such as
+`load_var`. Job vars use the same model rather than adding another interpolation
+mechanism: they initialize the build's root local scope before its first step.
+
+RFC #27 also proposed `get_var`, which could trigger a job when a value fetched
+from a configured var source changed and then place that value in the local
+scope. The two designs differ in origin and lifetime. `get_var` represents a
+pulled current value owned by an external var source; a trigger override is an
+explicit value supplied by the actor creating one build. Both are intentionally
+distinct from versioned resources.
+
+### `across`, `set_pipeline`, and instanced pipelines
+
+[RFC #29][rfc-29] uses child local scopes to execute one plan across a set or
+matrix of values. Job vars instead select one value set for one build. The two
+compose: an `across` step may read a job var when determining its values, and
+its scoped vars may shadow root job vars according to the existing rules.
+
+The spatial-automation design combines `across`, the [`set_pipeline`
+step][rfc-31], and [instanced pipelines][rfc-34] to reconcile a set of durable
+pipeline instances, for example one per pull request. Job vars do not identify
+a pipeline and do not create or archive instances. They are build metadata for
+cases where creating durable pipeline state would be disproportionate.
+
+### Var sources and prototypes
+
+[RFC #39][rfc-39] configures named sources for looking up vars, principally
+credentials, and leaves broader source types to the prototype model. Job vars
+are not another configured var source: they are non-secret values in the
+already-defined build-local `.` source. Secret or shared parameters would
+cross that boundary and therefore remain future work.
+
+[RFC #38][rfc-38] deliberately left webhooks out of the resource prototype
+interface while suggesting that Concourse might map webhooks to resource
+checks. This proposal preserves that path for versioned state. Its direct
+trigger webhook covers a different case: a delivered invocation whose mapped
+values become explicit metadata for one build. Provider-specific verification
+or pluggable mapping may still build on prototypes in a later design.
+
+### Resource check webhooks
+
+Concourse's existing resource webhook ignores the request payload and starts
+the resource's normal `check`. This [deliberately retains one eventually
+consistent external source of truth][resource-webhook-rationale] and avoids
+giving a resource type multiple ways to discover versions. That behavior
+remains unchanged and should be preferred whenever an event merely indicates
+that queryable resource state may have changed.
+
+Trigger webhooks consume mapped payload fields because their purpose is to
+carry non-versioned invocation data into a build. This trades reconciliation
+and resource-version semantics for direct event delivery; the limitations are
+part of the interface rather than properties claimed from resources.
+
 ## Prior art
 
 ### GitLab
@@ -416,6 +510,19 @@ when the parameters are real external, versioned state. It does not provide a
 native manual form or a direct webhook-to-build path and requires mutating an
 external store before triggering.
 
+### A resource check webhook or `get_var`
+
+If a webhook means “the external source may have changed,” Concourse should
+continue to ignore its payload, run the resource's normal `check`, and schedule
+from discovered versions. This is resilient to duplicate or missed webhook
+deliveries because polling and checking reconcile against the source of truth.
+
+A future `get_var` trigger is similarly appropriate for an unversioned value
+which can be fetched from a configured var source and compared with its prior
+value. Neither model handles an invocation value known only to the caller
+without first persisting it in another system. Trigger webhooks address that
+narrow case and make the delivery semantics explicit.
+
 ### Provider-specific webhook handlers
 
 Native handlers could validate provider signatures and offer richer event
@@ -440,6 +547,13 @@ The PoC stores only explicit overrides and resolves defaults from current job
 configuration when execution starts. Reruns copy only overrides. This is
 simple, keeps defaults in pipeline configuration, and resembles other
 Concourse runtime configuration lookups.
+
+This also follows the [reasoning recorded during `get_var`
+design][get-var-current-values]: resources are for values which must be
+versioned and reproduced, while vars may represent a current value which should
+be resolved again on rerun. Job vars add one qualification to that precedent
+by preserving values the triggering actor explicitly selected while continuing
+to treat unoverridden defaults as current configuration.
 
 The tradeoff is that a queued build or rerun can observe a default different
 from the one visible when its original build was created. Snapshotting all
@@ -504,6 +618,10 @@ implementation:
   version selection, as suggested in discussion #9053.
 * **Signed provider webhooks.** Provider-specific signature verification or a
   pluggable verifier may build on the generic mapping model.
+* **Delivery identity and duplicate suppression.** A later design could record
+  provider delivery identifiers and define replay windows, retention, and
+  conflict behavior. These semantics should not be inferred from a
+  provider-neutral payload in the first version.
 
 ## New implications
 
@@ -519,11 +637,20 @@ implementation:
 * Generic webhooks allow external systems to create builds without a bearer
   token. Operators must manage dedicated tokens and prevent query-string
   leakage.
+* Generic webhooks are event-delivery mechanisms. Retries can create duplicate
+  builds, ordering is not guaranteed, and missed requests are not reconciled.
 * Supporting typed values embedded in strings broadens scalar interpolation
   for local vars and should be covered by compatibility tests.
 
 [discussion]: https://github.com/orgs/concourse/discussions/9053
 [rfc-27]: https://github.com/concourse/rfcs/pull/27
+[rfc-29]: https://github.com/concourse/rfcs/pull/29
+[rfc-31]: https://github.com/concourse/rfcs/pull/31
+[rfc-34]: https://github.com/concourse/rfcs/pull/34
+[rfc-38]: https://github.com/concourse/rfcs/pull/38
+[rfc-39]: https://github.com/concourse/rfcs/pull/39
+[get-var-current-values]: https://github.com/concourse/concourse/issues/5815#issuecomment-711415300
+[resource-webhook-rationale]: https://github.com/concourse/concourse/issues/331#issuecomment-382419366
 [gitlab-inputs]: https://docs.gitlab.com/ci/inputs/
 [gitlab-variables]: https://docs.gitlab.com/ci/variables/
 [github-inputs]: https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#onworkflow_dispatchinputs
