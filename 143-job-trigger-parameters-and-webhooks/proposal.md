@@ -1,3 +1,4 @@
+* RFC PR: [concourse/rfcs#143](https://github.com/concourse/rfcs/pull/143)
 * Related discussion: [concourse discussion #9053](https://github.com/orgs/concourse/discussions/9053)
 * Proof of concept: [gbrlcrpntr/concourse, `job-vars-poc`](https://github.com/gbrlcrpntr/concourse/tree/job-vars-poc/poc)
 
